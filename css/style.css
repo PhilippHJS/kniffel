@@ -125,8 +125,9 @@ svg { width: 1.2em; height: 1.2em; flex: none; }
 .net i { flex: none; width: 10px; height: 10px; border-radius: 50%; background: #d08700; }
 .net-online i { background: #1f9254; }
 .net-stuck i, .net-host-offline i, .net-unsupported i { background: var(--danger); }
+/* Auf schmalen Bildschirmen bleibt nur der Punkt, der Text steht dann im Hinweis darunter. */
 @media (max-width: 520px) {
-  .net-online { font-size: 0; gap: 0; }
+  .net { font-size: 0; gap: 0; }
 }
 
 #main { max-width: 1080px; margin: 0 auto; padding: 14px 16px 28px; }

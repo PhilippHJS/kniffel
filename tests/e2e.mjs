@@ -8,13 +8,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
-import { PeerServer } from 'peer';
+import { Aedes } from 'aedes';
+import { WebSocketServer, createWebSocketStream } from 'ws';
+import mqtt from 'mqtt';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const shots = process.env.SHOTS || path.join(root, 'tests', 'shots');
 const WEB_PORT = 8123;
-const PEER_PORT = 9123;
-const BASE = `http://localhost:${WEB_PORT}/?peer=localhost:${PEER_PORT}`;
+const RELAY_PORTS = [9123, 9124];
+const RELAYS = RELAY_PORTS.map((port) => `ws://localhost:${port}`).join(',');
+const BASE = `http://localhost:${WEB_PORT}/?relay=${RELAYS}`;
 fs.mkdirSync(shots, { recursive: true });
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.txt': 'text/plain' };
@@ -28,7 +31,30 @@ const web = http.createServer((req, res) => {
   res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store' });
   fs.createReadStream(file).pipe(res);
 }).listen(WEB_PORT, '127.0.0.1');
-const peerServer = PeerServer({ host: '127.0.0.1', port: PEER_PORT, path: '/' });
+
+// Lokale Vermittler anstelle der öffentlichen. Lassen sich einzeln abschalten.
+async function startBroker(port) {
+  const broker = await Aedes.createBroker();
+  const server = http.createServer();
+  const sockets = new WebSocketServer({ server });
+  sockets.on('connection', (socket, req) => broker.handle(createWebSocketStream(socket), req));
+  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+  return {
+    async stop() {
+      for (const socket of sockets.clients) socket.terminate();
+      await new Promise((resolve) => server.close(resolve));
+      await new Promise((resolve) => broker.close(resolve));
+    },
+  };
+}
+const brokers = [];
+for (const port of RELAY_PORTS) brokers.push(await startBroker(port));
+
+// Ein Fremder, der beim Vermittler alles mitliest.
+const overheard = [];
+const lurker = mqtt.connect(`ws://127.0.0.1:${RELAY_PORTS[0]}`);
+lurker.on('connect', () => lurker.subscribe('#'));
+lurker.on('message', (topic, payload) => overheard.push({ topic, text: payload.toString('latin1'), size: payload.length }));
 
 const problems = [];
 const check = (ok, text) => {
@@ -39,7 +65,7 @@ const check = (ok, text) => {
 const browser = await chromium.launch({
   executablePath: process.env.CHROME || '/usr/bin/google-chrome',
   headless: true,
-  args: ['--no-sandbox', '--no-proxy-server', '--disable-features=WebRtcHideLocalIpsWithMdns'],
+  args: ['--no-sandbox', '--no-proxy-server'],
 });
 
 const PHONE = { width: 390, height: 844 };
@@ -48,7 +74,8 @@ const DESKTOP = { width: 1280, height: 860 };
 function watch(page, label) {
   page.on('pageerror', (err) => problems.push(`${label}: Seitenfehler ${err.message}`));
   page.on('console', (msg) => {
-    if (msg.type() === 'error') problems.push(`${label}: Konsole ${msg.text()}`);
+    // Abgeschaltete Vermittler meldet der Browser selbst als Fehler, das gehört zum Test.
+    if (msg.type() === 'error' && !/WebSocket|ERR_CONNECTION/.test(msg.text())) problems.push(`${label}: Konsole ${msg.text()}`);
   });
   page.on('dialog', (dialog) => dialog.accept());
   page.label = label;
@@ -218,10 +245,6 @@ try {
       const beforeReload = JSON.stringify((await view(anna)).players.map((p) => p.scores));
       await host.reload();
       await untilView(host, () => window.__kniffel.view && window.__kniffel.view.phase === 'playing');
-      for (const page of [anna, ben]) {
-        await page.waitForFunction(() => window.__kniffel.net !== 'online', null, { timeout: 30000 }).catch(() => {});
-        await page.waitForFunction(() => window.__kniffel.net === 'online', null, { timeout: 40000 });
-      }
       await untilView(host, () => window.__kniffel.view.players.every((p) => p.connected));
       const afterReload = JSON.stringify((await view(host)).players.map((p) => p.scores));
       check(beforeReload === afterReload, 'Spielstand übersteht das Neuladen des Gastgebers');
@@ -278,10 +301,12 @@ try {
   }, `kniffel:room:${room}`);
   await host.reload();
   await untilView(host, () => window.__kniffel.view && window.__kniffel.view.phase === 'playing');
-  for (const page of [anna, ben]) {
-    await page.waitForFunction(() => window.__kniffel.net !== 'online', null, { timeout: 30000 }).catch(() => {});
-    await page.waitForFunction(() => window.__kniffel.net === 'online', null, { timeout: 40000 });
-    await untilView(page, () => window.__kniffel.view.players.some((p) => (p.items || []).length > 0 || p.itemCount > 0));
+  // Alle sehen die neu verteilten Hände: zwei Items beim Spieler am Zug, eins bei den anderen.
+  for (const page of pages) {
+    await untilView(page, () => {
+      const v = window.__kniffel.view;
+      return v.players.every((p, index) => p.itemCount === (index === v.current ? 2 : 1));
+    });
   }
 
   let page = await actorPage(pages);
@@ -384,6 +409,43 @@ try {
   await playTurn(pages, 300, { wantItems: false });
   check(true, 'Danach geht das Spiel normal weiter');
 
+  // Ein Vermittler fällt aus: Das Spiel läuft über den anderen weiter.
+  const upOn = (candidate) => candidate.evaluate(() => window.__kniffel.relays.up);
+  check((await upOn(host)) === 2 && (await upOn(anna)) === 2, 'Alle Geräte hängen an beiden Vermittlern');
+  await brokers[0].stop();
+  for (const candidate of pages) await candidate.waitForFunction(() => window.__kniffel.relays.up === 1, null, { timeout: 20000 });
+  await playTurn(pages, 301, { wantItems: false });
+  await playTurn(pages, 302, { wantItems: false });
+  check((await view(host)).players.every((p) => p.connected), 'Fällt ein Vermittler aus, läuft das Spiel über den anderen weiter');
+
+  // Beide fallen aus: Alle sehen einen Hinweis, danach geht es von selbst weiter.
+  await brokers[1].stop();
+  for (const candidate of pages) await candidate.waitForSelector('.notice.warn', { timeout: 20000 });
+  check((await host.textContent('.notice.warn')).includes('niemand beitreten'), 'Ohne Vermittler sieht der Gastgeber, dass niemand mitspielen kann');
+  await shot(host, '14-keine-verbindung');
+  brokers[0] = await startBroker(RELAY_PORTS[0]);
+  brokers[1] = await startBroker(RELAY_PORTS[1]);
+  for (const candidate of pages) await candidate.waitForFunction(() => window.__kniffel.net === 'online', null, { timeout: 40000 });
+  await untilView(host, () => window.__kniffel.view.players.every((p) => p.connected));
+  await playTurn(pages, 303, { wantItems: false });
+  check(true, 'Nach dem Ausfall geht das Spiel von selbst weiter');
+
+  // Falscher Raumcode: Es gibt keinen Gastgeber, und das steht auch da.
+  const lost = await device('Falscher Code', PHONE);
+  await lost.goto(`${BASE}&r=ZZZZZ`);
+  await lost.fill('#f-name', 'Irrläufer');
+  await lost.click('[data-form="enter"] button[type="submit"]');
+  await lost.waitForFunction(() => window.__kniffel.net === 'host-offline', null, { timeout: 20000 });
+  check((await lost.textContent('.panel')).includes('Gastgeber nicht erreichbar'), 'Falscher Raumcode: Hinweis statt endlosem Warten');
+  await shot(lost, '15-kein-gastgeber');
+  await lost.context().close();
+
+  // Was ein Fremder beim Vermittler mitlesen konnte.
+  const leaked = overheard.filter((m) => /Anna|Benjamin|Oma Erna|players|scores/.test(m.text) || m.topic.includes(room) || m.topic.toLowerCase().includes(room.toLowerCase()));
+  check(overheard.length > 200 && leaked.length === 0, `Mitgelesen: ${overheard.length} Nachrichten, keine davon lesbar`);
+  const stateSizes = overheard.filter((m) => m.topic.endsWith('/g')).map((m) => m.size);
+  console.log(`     Spielstand-Nachrichten: ${stateSizes.length}, im Mittel ${Math.round(stateSizes.reduce((a, b) => a + b, 0) / stateSizes.length)} Bytes, größte ${Math.max(...stateSizes)} Bytes`);
+
   // ---------- Sechs Spieler an einem kleinen Handy ----------
   const small = await device('Sechs an einem Gerät', { width: 360, height: 740 });
   await small.goto(BASE);
@@ -416,7 +478,8 @@ try {
 } finally {
   await browser.close();
   web.close();
-  peerServer.close?.();
+  lurker.end(true);
+  for (const broker of brokers) await broker.stop().catch(() => {});
 }
 
 if (problems.length) {

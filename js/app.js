@@ -5,8 +5,8 @@ import {
   DOUBLE_CAP, CURSE_PENALTY, EXTRA_KNIFFEL_BONUS,
   createGame, addPlayer, renamePlayer, removePlayer, startGame, backToLobby, applyAction,
   viewFor, totals, potentialScore, jokerActive, itemProblem, targetProblem, pendingAttack, cleanName,
-} from './game.js';
-import { createHost, createClient } from './net.js';
+} from './game.js?v=2';
+import { createHost, createGuest, DEFAULT_RELAYS } from './net.js?v=2';
 
 // ---------- Kleine Helfer ----------
 
@@ -54,20 +54,24 @@ function normalizeRoom(raw) {
 }
 
 const query = new URLSearchParams(location.search);
-// Nur für Tests auf dem eigenen Rechner: ?peer=localhost:9000 nutzt einen lokalen Vermittlungsdienst.
-const devPeer = ['localhost', '127.0.0.1'].includes(location.hostname) ? query.get('peer') : null;
-function peerOptions() {
-  if (!devPeer) return {};
-  const [host, port] = devPeer.split(':');
-  return { host, port: Number(port) || 9000, path: '/', secure: false, config: { iceServers: [] } };
+// Nur für Tests auf dem eigenen Rechner: ?relay=ws://localhost:9001,ws://localhost:9002
+// nutzt lokale Vermittler statt der öffentlichen.
+const devRelay = ['localhost', '127.0.0.1'].includes(location.hostname) ? query.get('relay') : null;
+function relayUrls() {
+  if (!devRelay) return DEFAULT_RELAYS;
+  return devRelay.split(',').filter((url) => /^ws:\/\/(localhost|127\.0\.0\.1):\d+\/?$/.test(url));
 }
 function roomUrl(room) {
   const url = new URL(location.pathname, location.origin);
   url.searchParams.set('r', room);
-  if (devPeer) url.searchParams.set('peer', devPeer);
+  if (devRelay) url.searchParams.set('relay', devRelay);
   return url.toString();
 }
-const homeUrl = () => new URL(location.pathname, location.origin).toString() + (devPeer ? `?peer=${devPeer}` : '');
+function homeUrl() {
+  const url = new URL(location.pathname, location.origin);
+  if (devRelay) url.searchParams.set('relay', devRelay);
+  return url.toString();
+}
 
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
@@ -79,6 +83,7 @@ const app = {
   role: null, // host | guest
   view: null,
   net: 'connecting',
+  relays: { up: 0, total: 0 },
   host: null,
   client: null,
   goneText: '',
@@ -139,19 +144,32 @@ function netLabel() {
   const host = {
     online: 'Raum offen',
     connecting: 'Raum wird geöffnet …',
-    reconnecting: 'Vermittlung nicht erreichbar',
+    reconnecting: 'Keine Verbindung',
+    stuck: 'Keine Verbindung möglich',
     unsupported: 'Browser wird nicht unterstützt',
-    taken: 'Raum woanders geöffnet',
   };
   const guest = {
     online: 'Verbunden',
     connecting: 'Verbinde …',
-    reconnecting: 'Verbindung weg, neuer Versuch …',
+    reconnecting: 'Keine Verbindung',
     'host-offline': 'Gastgeber nicht erreichbar',
-    stuck: 'Verbindung klappt nicht',
+    stuck: 'Keine Verbindung möglich',
     unsupported: 'Browser wird nicht unterstützt',
   };
   return (app.role === 'host' ? host : guest)[app.net] || '';
+}
+
+const NET_HINTS = {
+  stuck: 'Von diesem Netz aus ist kein Vermittlungsdienst erreichbar. Das passiert vor allem in Firmennetzen und über VPN. Probier ein anderes Netz, zum Beispiel den Hotspot deines Handys.',
+  reconnecting: 'Dieses Gerät erreicht gerade keinen Vermittlungsdienst. Es geht von selbst weiter, sobald die Verbindung wieder steht.',
+  'host-offline': 'Der Gastgeber hat den Raum gerade nicht geöffnet. Sobald seine Seite wieder offen ist, geht es von selbst weiter.',
+  unsupported: 'Dieser Browser ist zu alt für das Spiel. Probier einen aktuellen Chrome, Firefox, Edge oder Safari.',
+};
+
+// Für die Fehlersuche: über wie viele der Vermittlungsdienste dieses Gerät gerade verbunden ist.
+function relayLine() {
+  if (!app.relays.total) return '';
+  return `<p class="hint">Vermittlungsdienste erreichbar: ${app.relays.up} von ${app.relays.total}</p>`;
 }
 
 // ---------- Kopfzeile ----------
@@ -218,17 +236,13 @@ function nameHtml() {
 }
 
 function waitingHtml() {
-  const hints = {
-    'host-offline': 'Der Gastgeber hat den Raum gerade nicht geöffnet. Sobald seine Seite wieder offen ist, geht es von selbst weiter.',
-    stuck: 'Die direkte Verbindung kommt nicht zustande. Oft hilft ein anderes Netz, zum Beispiel mobile Daten statt WLAN.',
-    unsupported: 'Dieser Browser kann keine direkte Verbindung aufbauen. Probier einen aktuellen Chrome, Firefox, Edge oder Safari.',
-  };
   return `
     <section class="home">
       <div class="panel center">
         <h1 class="small">Raum ${esc(app.room)}</h1>
         <p class="lead">${esc(netLabel())}</p>
-        ${hints[app.net] ? `<p class="hint">${hints[app.net]}</p>` : ''}
+        ${NET_HINTS[app.net] ? `<p class="hint">${NET_HINTS[app.net]}</p>` : ''}
+        ${relayLine()}
         <a class="btn" href="${esc(homeUrl())}">Zur Startseite</a>
       </div>
     </section>`;
@@ -292,6 +306,7 @@ function lobbyHtml(view) {
 
   return `
     <section class="lobby">
+      ${netNoticeHtml()}
       <div class="panel invite">
         <h1 class="small">Raum <span class="code">${esc(app.room)}</span></h1>
         <label for="f-link">Schick diesen Link an alle, die mitspielen sollen.</label>
@@ -523,14 +538,17 @@ function logHtml(view) {
     </section>`;
 }
 
-function noticeHtml(view, ctx) {
-  const notes = [];
-  if (app.role === 'guest' && app.net !== 'online') {
-    const text = app.net === 'stuck'
-      ? 'Die direkte Verbindung kommt nicht zustande. Oft hilft ein anderes Netz, zum Beispiel mobile Daten statt WLAN.'
-      : 'Die Verbindung zum Gastgeber ist unterbrochen. Es geht weiter, sobald sie wieder steht.';
-    notes.push(`<p class="notice warn">${text}</p>`);
+function netNoticeHtml() {
+  if (app.net === 'online' || app.net === 'connecting') return '';
+  let text = NET_HINTS[app.net] || '';
+  if (app.role === 'host' && (app.net === 'stuck' || app.net === 'reconnecting')) {
+    text += ' Solange kann niemand beitreten oder mitspielen.';
   }
+  return `<p class="notice warn"><strong>${esc(netLabel())}.</strong> ${text}</p>`;
+}
+
+function noticeHtml(view, ctx) {
+  const notes = [netNoticeHtml()];
   if (ctx.mine.length === 0) {
     notes.push('<p class="notice">Du schaust zu. In diesem Spiel hast du keinen Platz.</p>');
   }
@@ -653,6 +671,7 @@ function roomSheetHtml(view) {
     <h3>Am Tisch</h3>
     <ul class="seats">${players}</ul>
     ${ctx.isHost ? '<p class="hint">Du bist Gastgeber: Dein Gerät führt den Spielstand. Lass diese Seite offen, bis das Spiel vorbei ist.</p>' : ''}
+    ${relayLine()}
     <div class="sheetfoot"><button type="button" class="btn" data-act="close" data-key="sheet-close">Schließen</button></div>`;
 }
 
@@ -879,32 +898,64 @@ function showStage() {
 
 // ---------- Gastgeber ----------
 
+function onNetStatus(status, relays) {
+  const before = app.net;
+  app.net = status;
+  app.relays = relays;
+  // Mitten im Spiel sieht man die Kopfzeile oft nicht: Wechsel kurz einblenden.
+  if (app.view && before !== status) {
+    const bad = ['reconnecting', 'host-offline', 'stuck'];
+    if (bad.includes(status)) toast(`${netLabel()}.`, 'error');
+    else if (status === 'online' && bad.includes(before)) toast('Wieder verbunden.');
+  }
+  render();
+}
+
 function startHost(room, record) {
   const state = record.state;
   const token = record.token;
-  const guests = new Map(); // Verbindung -> Zugangsschlüssel (oder null vor der Anmeldung)
+  let link = null;
+  let staleTimer = null;
 
   const ok = () => ({ ok: true });
   const fail = (error) => ({ ok: false, error });
 
   function refreshPresence() {
-    const online = new Set([token, ...guests.values()]);
-    for (const player of state.players) player.connected = online.has(player.owner);
+    for (const player of state.players) {
+      player.connected = player.owner === token || Boolean(link && link.isOnline(player.owner));
+    }
   }
 
-  function viewOf(owner) {
-    const view = viewFor(state, owner);
-    view.hostIds = state.players.filter((p) => p.owner === token).map((p) => p.id);
+  const hostIds = () => state.players.filter((p) => p.owner === token).map((p) => p.id);
+
+  // Was alle im Raum sehen dürfen: der Tisch ohne die Items auf den Händen.
+  function sharedView() {
+    const view = viewFor(state, null);
+    view.hostIds = hostIds();
+    view.log = view.log.slice(-16);
     return view;
+  }
+
+  // Was nur der Besitzer sehen darf: welche Plätze seine sind und welche Items er hält.
+  function privateFor(owner) {
+    const mine = state.players.filter((p) => p.owner === owner);
+    return {
+      mine: mine.map((p) => p.id),
+      items: Object.fromEntries(mine.map((p) => [p.id, [...p.items]])),
+    };
+  }
+
+  function cast() {
+    if (link) link.broadcast(sharedView(), privateFor);
   }
 
   function publish() {
     refreshPresence();
     store.set(roomKey(room), record);
-    for (const [conn, owner] of guests) {
-      if (owner) net.send(conn, { t: 'state', s: viewOf(owner) });
-    }
-    setView(viewOf(token));
+    cast();
+    const view = viewFor(state, token);
+    view.hostIds = hostIds();
+    setView(view);
   }
 
   function perform(owner, msg) {
@@ -945,58 +996,33 @@ function startHost(room, record) {
     }
   }
 
-  const net = createHost({
+  link = createHost({
     room,
-    options: peerOptions(),
-    onStatus(status) {
-      app.net = status;
-      if (status === 'taken') {
-        net.stop();
-        showGone('Dieser Raum ist schon in einem anderen Tab oder Fenster geöffnet. Spiel dort weiter, oder schließ das andere Fenster und mach hier weiter.');
-        return;
+    urls: relayUrls(),
+    onStatus: onNetStatus,
+    onHello(owner, msg) {
+      if (state.phase === 'lobby' && !state.players.some((p) => p.owner === owner)) {
+        addPlayer(state, { name: msg.name, owner });
       }
-      render();
+      publish();
     },
-    onOpen(conn) {
-      guests.set(conn, null);
-    },
-    onClose(conn) {
-      const owner = guests.get(conn);
-      guests.delete(conn);
-      if (owner) publish();
-    },
-    onMessage(conn, msg) {
-      if (!msg || typeof msg !== 'object' || !guests.has(conn)) return;
-      if (msg.t === 'ping') {
-        net.send(conn, { t: 'pong' });
-        return;
-      }
-      if (msg.t === 'hello') {
-        if (typeof msg.token !== 'string' || !/^[0-9a-f]{32}$/.test(msg.token) || msg.token === token) return;
-        // Dasselbe Gerät in einem zweiten Tab: Der neue Tab übernimmt.
-        for (const [other, owner] of guests) {
-          if (other !== conn && owner === msg.token) {
-            net.send(other, { t: 'bye', reason: 'replaced' });
-            guests.set(other, null);
-          }
-        }
-        guests.set(conn, msg.token);
-        if (state.phase === 'lobby' && !state.players.some((p) => p.owner === msg.token)) {
-          addPlayer(state, { name: msg.name, owner: msg.token });
-        }
-        publish();
-        return;
-      }
-      const owner = guests.get(conn);
-      if (!owner) return;
+    onMessage(owner, msg) {
       const result = perform(owner, msg);
       if (result.ok) publish();
-      else net.send(conn, { t: 'err', text: result.error });
+      else link.sendTo(owner, { t: 'err', text: result.error });
     },
+    // Jemand hat einen Stand verpasst: kurz sammeln, dann allen noch einmal schicken.
+    onStale() {
+      if (staleTimer) return;
+      staleTimer = setTimeout(() => {
+        staleTimer = null;
+        cast();
+      }, 400);
+    },
+    onPresence: publish,
   });
 
-  refreshPresence();
-  setView(viewOf(token));
+  publish();
 
   return {
     send(msg) {
@@ -1010,29 +1036,27 @@ function startHost(room, record) {
 // ---------- Mitspieler ----------
 
 function startGuest(room, record, name) {
-  const net = createClient({
+  const link = createGuest({
     room,
-    options: peerOptions(),
-    onStatus(status) {
-      app.net = status;
-      render();
+    urls: relayUrls(),
+    name,
+    saved: record.keys || null,
+    onIdentity(keys) {
+      record.keys = keys;
+      store.set(roomKey(room), record);
     },
-    onReady() {
-      net.send({ t: 'hello', token: record.token, name });
+    onStatus: onNetStatus,
+    onView: setView,
+    onError(text) {
+      toast(text, 'error');
     },
-    onMessage(msg) {
-      if (!msg || typeof msg !== 'object') return;
-      if (msg.t === 'state' && msg.s) setView(msg.s);
-      else if (msg.t === 'err') toast(String(msg.text), 'error');
-      else if (msg.t === 'bye') {
-        net.stop();
-        showGone('Du hast diesen Raum in einem anderen Tab oder Fenster geöffnet. Dort geht es weiter.');
-      }
+    onReplaced() {
+      showGone('Du hast diesen Raum in einem anderen Tab oder Fenster geöffnet. Dort geht es weiter.');
     },
   });
   return {
     send(msg) {
-      if (!net.send(msg)) toast('Gerade keine Verbindung zum Gastgeber. Versuch es gleich nochmal.', 'error');
+      if (!link.send(msg)) toast('Gerade keine Verbindung zum Gastgeber. Versuch es gleich nochmal.', 'error');
     },
   };
 }
@@ -1114,8 +1138,8 @@ function enterRoom(room) {
 
 function joinAsGuest(room, name) {
   let record = store.get(roomKey(room));
-  if (!record || record.role !== 'guest' || !record.token) {
-    record = { role: 'guest', token: randomToken() };
+  if (!record || record.role !== 'guest') {
+    record = { role: 'guest' };
     store.set(roomKey(room), record);
   }
   app.screen = 'room';
@@ -1327,7 +1351,7 @@ $('#sheet').addEventListener('close', () => {
 });
 
 // Für die Browser-Tests: aktueller Stand, wie ihn diese Seite sieht.
-window.__kniffel = { get view() { return app.view; }, get net() { return app.net; }, get screen() { return app.screen; } };
+window.__kniffel = { get view() { return app.view; }, get net() { return app.net; }, get screen() { return app.screen; }, get relays() { return app.relays; } };
 
 // ---------- Los ----------
 

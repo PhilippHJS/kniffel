@@ -40,23 +40,27 @@ Auf jedem Spieler kann nur ein Angriff gleichzeitig liegen.
 Eine statische Seite ohne Server und ohne Build-Schritt.
 
 - `js/game.js`: Regeln, Wertung und Items, ohne Browser-Abhängigkeiten
-- `js/net.js`: Verbindung zwischen den Browsern
+- `js/net.js`: Verbindung zwischen den Geräten und Verschlüsselung
 - `js/app.js`: Oberfläche und Steuerung
 - `css/style.css`: Gestaltung
 
-Die Browser verbinden sich direkt miteinander (WebRTC über [PeerJS](https://peerjs.com)). Für den Verbindungsaufbau nutzt die Seite den öffentlichen, kostenlosen PeerJS-Dienst samt dessen Standard-Servern. Dieser Dienst und die Mitspieler sehen dabei die IP-Adressen der Beteiligten. Der Spielstand selbst liegt nur im Browser des Gastgebers.
+Die Geräte reden nicht direkt miteinander, sondern über vier öffentliche, kostenlose MQTT-Vermittler (EMQX, Eclipse, HiveMQ, Mosquitto). Jedes Gerät verbindet sich mit allen gleichzeitig, und jede Nachricht geht über alle, die gerade erreichbar sind. Es reicht, wenn einer funktioniert. Im Spiel zeigt der Dialog „Raum“, wie viele gerade erreichbar sind.
+
+Weil diese Dienste öffentlich sind, ist alles Ende-zu-Ende verschlüsselt (AES-GCM). Aus dem Raumcode entstehen der Raumschlüssel und der Name des Kanals. Jeder Mitspieler handelt mit dem Gastgeber zusätzlich einen eigenen Schlüssel aus (ECDH), über den seine Eingaben und seine Items laufen. Die Vermittler sehen die IP-Adressen der Geräte und verschlüsselte Daten, aber keine Namen und keinen Spielstand. Der Spielstand selbst liegt nur im Browser des Gastgebers.
+
+Die Vermittler sind als Testdienste gedacht und kommen ohne Garantie. Ihre Adressen stehen oben in `js/net.js` und lassen sich dort gegen einen eigenen austauschen.
 
 ## Entwickeln
 
 ```
 npm install
 npm test            # Regeln und Items
-npm run test:e2e    # komplette Partie in mehreren Browsern, braucht Chrome
+npm run test:e2e    # komplette Partie in mehreren Browsern über lokale Vermittler, braucht Chrome
 ```
 
 Zum Ausprobieren reicht ein beliebiger statischer Server im Projektordner, zum Beispiel `python3 -m http.server`.
 
 ## Fremde Bestandteile
 
-- PeerJS, MIT-Lizenz (`vendor/`)
+- MQTT.js, MIT-Lizenz (`vendor/`)
 - Schriften Barlow Semi Condensed und Kalam, SIL Open Font License (`fonts/`)
